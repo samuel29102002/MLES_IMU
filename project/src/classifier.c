@@ -11,7 +11,7 @@ const char* gesture_name(int cls) {
     }
 }
 
-// Simple rule-based thresholds (tune for your device)
+// Simple rule-based thresholds
 int classify(const feat_vec_t* f) {
     float s = f->amag.std;
     float df = f->amag.dom_freq;

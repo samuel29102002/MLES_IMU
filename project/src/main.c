@@ -18,8 +18,8 @@
 // -------------------- User-tunable basics --------------------
 #define CALIB_DURATION_SEC 2
 
-// NOTE: adjust scales to your IMU full-scale config if needed.
-// ICM-20948 defaults commonly: accel ±2g -> 16384 LSB/g, gyro ±1000 dps -> 32.8 LSB/dps
+
+// -------------------- IMU scaling (ICM-20948) ----------------
 #define ACCEL_SCALE_G      (1.0f / 16384.0f)
 #define GYRO_SCALE_DPS     (1.0f / 32.8f)
 
@@ -36,7 +36,7 @@ static inline absolute_time_t add_interval(absolute_time_t t, uint32_t delta_us)
 }
 
 #if LOG_FEATURES
-// copy a logical window from a circular buffer into a linear array
+// copy a logical window from the ring buffer to a linear buffer
 static void copy_window(float *dst, const float *ring, int ring_size, int start_idx) {
     for (int i = 0; i < ring_size; i++) {
         int idx = start_idx + i;
@@ -227,7 +227,7 @@ int main(void) {
             quantize_features_u8(&feat, qbuf, &q_len);
 #endif
 
-            // optionally drop gyro features/samples from output (for ablation)
+
 #if USE_GYRO
             const float gx_sample = gx;
             const float gy_sample = gy;
@@ -275,7 +275,7 @@ int main(void) {
                    feat.amag.std, feat.amag.bp1, feat.amag.bp2);
 #endif
         }
-#endif // LOG_FEATURES
+#endif
     }
 
     return 0;
