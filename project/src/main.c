@@ -9,11 +9,17 @@
 #include "pico/time.h"
 #include "hardware/i2c.h"
 
+#include "ff.h"
+#include "sd_card.h"
+#include "f_util.h"
+#include "hw_config.h"
+
 #include "config.h"
 #include "icm20948.h"
 #include "filters.h"
 #include "features.h"
 #include "classifier.h"
+#include "csv_logger.h"
 
 // -------------------- User-tunable basics --------------------
 #define CALIB_DURATION_SEC 2
@@ -22,6 +28,20 @@
 // -------------------- IMU scaling (ICM-20948) ----------------
 #define ACCEL_SCALE_G      (1.0f / 16384.0f)
 #define GYRO_SCALE_DPS     (1.0f / 32.8f)
+
+// -------------------- CSV logging ----------------------------
+#define CSV_PATH_MAX  96
+#define CSV_LINE_MAX  192
+
+static FATFS g_fs;                     // FatFs must persist for mount lifetime
+static sd_card_t *g_sd = NULL;
+static const char *g_drive_prefix = NULL;
+static csv_logger_t g_csv_logger;
+static bool g_csv_logger_ready = false;
+static bool g_csv_logger_failed = false;
+
+static const char kCsvHeader[] =
+    "t_ms,ax,ay,az,gx,gy,gz,amag_std,dom_freq,bp1,bp2,gx_std,gy_std,gz_std,cls,lat_ms,qbytes";
 
 // -------------------- Derived sizes --------------------------
 #define WIN_SAMPLES ((SAMPLE_HZ * WIN_MS) / 1000)
@@ -33,6 +53,133 @@ _Static_assert(HOP_SAMPLES > 0, "HOP_MS must yield at least one sample");
 // -------------------- Helpers -------------------------------
 static inline absolute_time_t add_interval(absolute_time_t t, uint32_t delta_us) {
     return delayed_by_us(t, delta_us);
+}
+
+static inline void report_fresult(const char *op, FRESULT fr) {
+    printf("%s -> %s (%d)\n", op, FRESULT_str(fr), fr);
+}
+
+static void format_csv_line(char *out, size_t n,
+                            uint32_t t_ms,
+                            float ax, float ay, float az,
+                            float gx, float gy, float gz,
+                            float amag_std, float dom_f, float bp1, float bp2,
+                            float gx_std, float gy_std, float gz_std,
+                            int cls, float lat_ms, int qbytes) {
+    snprintf(out, n,
+             "%u,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%d,%.3f,%d",
+             t_ms, ax, ay, az, gx, gy, gz,
+             amag_std, dom_f, bp1, bp2, gx_std, gy_std, gz_std,
+             cls, lat_ms, qbytes);
+}
+
+static bool ensure_sd_mounted(void) {
+    if (g_drive_prefix) {
+        return true;
+    }
+
+    if (!sd_init_driver()) {
+        printf("sd_init_driver() failed\n");
+        return false;
+    }
+
+    g_sd = sd_get_by_num(0);
+    if (!g_sd) {
+        printf("sd_get_by_num(0) returned NULL\n");
+        return false;
+    }
+
+    g_drive_prefix = sd_get_drive_prefix(g_sd);
+    if (!g_drive_prefix) {
+        printf("sd_get_drive_prefix() returned NULL\n");
+        return false;
+    }
+
+    FRESULT fr = f_mount(&g_fs, g_drive_prefix, 1);
+    if (fr == FR_NO_FILESYSTEM) {
+        BYTE work[4096];
+        MKFS_PARM opt = { FM_FAT | FM_SFD, 0, 0, 0, 0 };
+        report_fresult("f_mount (no filesystem)", fr);
+        fr = f_mkfs(g_drive_prefix, &opt, work, sizeof work);
+        if (fr != FR_OK) {
+            report_fresult("f_mkfs", fr);
+            return false;
+        }
+        fr = f_mount(&g_fs, g_drive_prefix, 1);
+    }
+
+    if (fr != FR_OK) {
+        report_fresult("f_mount", fr);
+        return false;
+    }
+
+    return true;
+}
+
+static bool init_csv_logging(void) {
+    if (g_csv_logger_ready) return true;
+    if (g_csv_logger_failed) return false;
+
+    if (!ensure_sd_mounted()) {
+        g_csv_logger_failed = true;
+        return false;
+    }
+
+    char logs_dir[CSV_PATH_MAX];
+    snprintf(logs_dir, sizeof logs_dir, "%s/logs", g_drive_prefix);
+    FRESULT fr = f_mkdir(logs_dir);
+    if (fr != FR_OK && fr != FR_EXIST) {
+        report_fresult("f_mkdir(logs)", fr);
+        g_csv_logger_failed = true;
+        return false;
+    }
+
+    uint32_t session_ms = to_ms_since_boot(get_absolute_time());
+    char file_path[CSV_PATH_MAX];
+    snprintf(file_path, sizeof file_path, "%s/session_%lu.csv",
+             logs_dir, (unsigned long)session_ms);
+
+    fr = csv_open(&g_csv_logger, file_path, kCsvHeader);
+    if (fr != FR_OK) {
+        report_fresult("csv_open", fr);
+        g_csv_logger_failed = true;
+        return false;
+    }
+
+    g_csv_logger_ready = true;
+    printf("SD logging to %s\n", file_path);
+    return true;
+}
+
+static void append_csv_line(uint32_t t_ms,
+                            float ax, float ay, float az,
+                            float gx, float gy, float gz,
+                            float amag_std, float dom_f, float bp1, float bp2,
+                            float gx_std, float gy_std, float gz_std,
+                            int cls, float lat_ms, int qbytes) {
+    if (g_csv_logger_failed) return;
+    if (!g_csv_logger_ready) {
+        if (!init_csv_logging()) {
+            printf("CSV logger disabled (init failed).\n");
+            return;
+        }
+    }
+
+    char line[CSV_LINE_MAX];
+    format_csv_line(line, sizeof line,
+                    t_ms, ax, ay, az,
+                    gx, gy, gz,
+                    amag_std, dom_f, bp1, bp2,
+                    gx_std, gy_std, gz_std,
+                    cls, lat_ms, qbytes);
+
+    FRESULT fr = csv_append(&g_csv_logger, line);
+    if (fr != FR_OK) {
+        report_fresult("csv_append", fr);
+        csv_close(&g_csv_logger);
+        g_csv_logger_ready = false;
+        g_csv_logger_failed = true;
+    }
 }
 
 #if LOG_FEATURES
@@ -110,6 +257,10 @@ int main(void) {
     printf("Calibration done. Bias accel[g]: %.5f %.5f %.5f | gyro[dps]: %.5f %.5f %.5f\n",
            bias_ax, bias_ay, bias_az, bias_gx, bias_gy, bias_gz);
 #endif
+
+    if (!init_csv_logging()) {
+        printf("SD logging not active (initialization failed).\n");
+    }
 
     // --------- Buffers for windowed feature computation ----------
 #if LOG_FEATURES
@@ -265,6 +416,20 @@ int main(void) {
                    lat_ms,
                    q_len);
 
+            append_csv_line(t_ms,
+                            ax, ay, az,
+                            gx_sample, gy_sample, gz_sample,
+                            feat.amag.std,
+                            feat.amag.dom_freq,
+                            feat.amag.bp1,
+                            feat.amag.bp2,
+                            gx_std_val,
+                            gy_std_val,
+                            gz_std_val,
+                            cls,
+                            lat_ms,
+                            q_len);
+
             if (lat_ms > 20.0f) {
                 printf("WARN: feature latency=%.2f ms (OVERRUN)\n", lat_ms);
             }
@@ -276,6 +441,10 @@ int main(void) {
 #endif
         }
 #endif
+    }
+
+    if (g_csv_logger_ready) {
+        csv_close(&g_csv_logger);
     }
 
     return 0;
